@@ -28,6 +28,7 @@ message ClientOriginatedMessage {
     CreateDirectoryRequest create_directory_request = 132;
     InstallRequest install_request = 133;
     TelemetryPageRequest telemetry_page_request = 134;
+    SamplingApprovalRequest sampling_approval_request = 135;
     AggregateSessionMetricActionRequest aggregate_session_metric_action_request = 135;
     // UserLoginRequest user_login_request = 136;
     UserLogoutRequest user_logout_request = 137;
@@ -739,4 +740,32 @@ message EventNotification {
 
 message AccessibilityChangeNotification {
   bool enabled = 1;
+}
+
+// MCP Sampling messages
+message SamplingApprovalRequest {
+  string server_name = 1;
+  string prompt_content = 2;
+  optional string system_prompt = 3;
+  optional ModelPreferences model_preferences = 4;
+  int64 request_id = 5;
+  optional int32 max_tokens = 6;
+}
+
+message ModelPreferences {
+  repeated ModelHint hints = 1;
+  optional double cost_priority = 2;
+  optional double speed_priority = 3;
+  optional double intelligence_priority = 4;
+}
+
+message ModelHint {
+  string name = 1;
+}
+
+message SamplingApprovalResponse {
+  int64 request_id = 1;
+  bool approved = 2;
+  optional string modified_prompt = 3;
+  optional string error_message = 4;
 }

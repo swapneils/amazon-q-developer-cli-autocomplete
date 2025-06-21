@@ -19,11 +19,65 @@ use thiserror::Error;
 use tokio::time;
 use tokio::time::error::Elapsed;
 
+// MCP Sampling types
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingMessage {
+    pub role: String,
+    pub content: SamplingContent,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum SamplingContent {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { data: String, mime_type: String },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPreferences {
+    pub hints: Option<Vec<ModelHint>>,
+    pub cost_priority: Option<f64>,
+    pub speed_priority: Option<f64>,
+    pub intelligence_priority: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ModelHint {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingRequest {
+    pub messages: Vec<SamplingMessage>,
+    pub model_preferences: Option<ModelPreferences>,
+    pub system_prompt: Option<String>,
+    pub include_context: Option<String>, // "none" | "thisServer" | "allServers"
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    pub stop_sequences: Option<Vec<String>>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingResponse {
+    pub role: String,
+    pub content: SamplingContent,
+    pub model: String,
+    pub stop_reason: String,
+}
+
 use super::transport::base_protocol::{
     JsonRpcMessage,
     JsonRpcNotification,
     JsonRpcRequest,
     JsonRpcVersion,
+    JsonRpcError,
 };
 use super::transport::stdio::JsonRpcStdioTransport;
 use super::transport::{
@@ -67,9 +121,14 @@ struct ClientCapabilities {
 
 impl From<ClientInfo> for ClientCapabilities {
     fn from(client_info: ClientInfo) -> Self {
+        let mut capabilities = HashMap::new();
+        // Declare sampling capability support
+        capabilities.insert("sampling".to_string(), serde_json::json!({}));
+        
         ClientCapabilities {
+            protocol_version: JsonRpcVersion::default(),
+            capabilities,
             client_info,
-            ..Default::default()
         }
     }
 }
@@ -370,7 +429,60 @@ where
                 match listener.recv().await {
                     Ok(msg) => {
                         match msg {
-                            JsonRpcMessage::Request(_req) => {},
+                            JsonRpcMessage::Request(req) => {
+                                // Handle incoming requests from the server
+                                let JsonRpcRequest { method, .. } = &req;
+                                match method.as_str() {
+                                    "sampling/createMessage" => {
+                                        tracing::info!(target: "mcp", "Received sampling request from server: {}", server_name);
+                                        // Handle sampling request
+                                        match client_ref.handle_sampling_request(req.clone()).await {
+                                            Ok(response) => {
+                                                let msg = JsonRpcMessage::Response(response);
+                                                if let Err(e) = transport_ref.send(&msg).await {
+                                                    tracing::error!(target: "mcp", "Failed to send sampling response: {}", e);
+                                                }
+                                            },
+                                            Err(e) => {
+                                                tracing::error!(target: "mcp", "Failed to handle sampling request: {}", e);
+                                                // Send error response
+                                                let error_response = JsonRpcResponse {
+                                                    jsonrpc: JsonRpcVersion::default(),
+                                                    id: req.id,
+                                                    result: None,
+                                                    error: Some(JsonRpcError {
+                                                        code: -32603,
+                                                        message: format!("Internal error: {}", e),
+                                                        data: None,
+                                                    }),
+                                                };
+                                                let msg = JsonRpcMessage::Response(error_response);
+                                                if let Err(e) = transport_ref.send(&msg).await {
+                                                    tracing::error!(target: "mcp", "Failed to send error response: {}", e);
+                                                }
+                                            }
+                                        }
+                                    },
+                                    _ => {
+                                        tracing::warn!(target: "mcp", "Received unsupported request method: {}", method);
+                                        // Send method not found error
+                                        let error_response = JsonRpcResponse {
+                                            jsonrpc: JsonRpcVersion::default(),
+                                            id: req.id,
+                                            result: None,
+                                            error: Some(JsonRpcError {
+                                                code: -32601,
+                                                message: format!("Method not found: {}", method),
+                                                data: None,
+                                            }),
+                                        };
+                                        let msg = JsonRpcMessage::Response(error_response);
+                                        if let Err(e) = transport_ref.send(&msg).await {
+                                            tracing::error!(target: "mcp", "Failed to send method not found response: {}", e);
+                                        }
+                                    }
+                                }
+                            },
                             JsonRpcMessage::Notification(notif) => {
                                 let JsonRpcNotification { method, params, .. } = notif;
                                 match method.as_str() {
@@ -586,6 +698,145 @@ where
     fn get_id(&self) -> u64 {
         self.current_id.fetch_add(1, Ordering::SeqCst)
     }
+
+    /// Handle sampling/createMessage requests from MCP servers
+    pub async fn handle_sampling_request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse, ClientError> {
+        tracing::info!(target: "mcp", "Received sampling request from server: {}", self.server_name);
+        
+        // Parse the sampling request
+        let sampling_request: SamplingRequest = serde_json::from_value(
+            request.params.unwrap_or_default()
+        ).map_err(|e| ClientError::NegotiationError(format!("Invalid sampling request: {}", e)))?;
+
+        // Extract prompt content for approval
+        let prompt_content = sampling_request.messages
+            .iter()
+            .filter_map(|msg| match &msg.content {
+                SamplingContent::Text { text } => Some(text.clone()),
+                SamplingContent::Image { .. } => Some("[Image content]".to_string()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Request user approval via IPC
+        let approval_result = self.request_user_approval(
+            &prompt_content,
+            &sampling_request.system_prompt,
+            &sampling_request.model_preferences,
+            sampling_request.max_tokens,
+            &sampling_request.include_context,
+            sampling_request.temperature,
+            &sampling_request.stop_sequences,
+            &sampling_request.metadata,
+        ).await?;
+
+        if !approval_result.approved {
+            return Ok(JsonRpcResponse {
+                jsonrpc: JsonRpcVersion::default(),
+                id: request.id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -1,
+                    message: approval_result.error_message.unwrap_or_else(|| "User rejected sampling request".to_string()),
+                    data: None,
+                }),
+            });
+        }
+
+        // Use approved/modified prompt
+        let final_prompt = approval_result.modified_prompt.unwrap_or(prompt_content);
+        
+        // Make LLM call (this would integrate with Q CLI's existing LLM client)
+        let llm_response = self.make_llm_call(&final_prompt, &sampling_request).await?;
+
+        Ok(JsonRpcResponse {
+            jsonrpc: JsonRpcVersion::default(),
+            id: request.id,
+            result: Some(serde_json::to_value(llm_response)?),
+            error: None,
+        })
+    }
+
+    /// Request user approval for sampling via IPC
+    async fn request_user_approval(
+        &self,
+        prompt_content: &str,
+        system_prompt: &Option<String>,
+        model_preferences: &Option<ModelPreferences>,
+        max_tokens: Option<u32>,
+        include_context: &Option<String>,
+        temperature: Option<f64>,
+        stop_sequences: &Option<Vec<String>>,
+        metadata: &Option<serde_json::Value>,
+    ) -> Result<SamplingApprovalResult, ClientError> {
+        use crate::mcp_client::sampling_ipc::{SamplingIpcHandler, SamplingIpcError};
+        
+        let ipc_handler = SamplingIpcHandler::new();
+        
+        // Try desktop app approval first
+        match ipc_handler.request_approval(
+            &self.server_name,
+            prompt_content,
+            system_prompt,
+            model_preferences,
+            max_tokens,
+            include_context,
+            temperature,
+            stop_sequences,
+            metadata,
+        ).await {
+            Ok(result) => Ok(result),
+            Err(SamplingIpcError::DesktopUnavailable) => {
+                // Fallback to terminal approval
+                tracing::warn!(target: "mcp", "Desktop app unavailable, falling back to terminal approval");
+                ipc_handler.request_terminal_approval(&self.server_name, prompt_content)
+                    .await
+                    .map_err(|e| ClientError::NegotiationError(format!("Terminal approval failed: {}", e)))
+            },
+            Err(e) => Err(ClientError::NegotiationError(format!("Sampling approval failed: {}", e))),
+        }
+    }
+
+    /// Make LLM call with approved prompt
+    async fn make_llm_call(
+        &self,
+        prompt: &str,
+        request: &SamplingRequest,
+    ) -> Result<SamplingResponse, ClientError> {
+        // This would integrate with Q CLI's existing LLM client
+        // For now, returning a mock response that acknowledges the new parameters
+        let model_hint = request.model_preferences
+            .as_ref()
+            .and_then(|prefs| prefs.hints.as_ref())
+            .and_then(|hints| hints.first())
+            .map(|hint| hint.name.clone())
+            .unwrap_or_else(|| "default-model".to_string());
+            
+        let response_text = format!(
+            "Mock response to: {} (model: {}, temp: {:?}, max_tokens: {:?}, context: {:?})",
+            prompt,
+            model_hint,
+            request.temperature,
+            request.max_tokens,
+            request.include_context
+        );
+        
+        Ok(SamplingResponse {
+            role: "assistant".to_string(),
+            content: SamplingContent::Text {
+                text: response_text,
+            },
+            model: model_hint,
+            stop_reason: "endTurn".to_string(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct SamplingApprovalResult {
+    pub approved: bool,
+    pub modified_prompt: Option<String>,
+    pub error_message: Option<String>,
 }
 
 fn examine_server_capabilities(ser_cap: &JsonRpcResponse) -> Result<(), ClientError> {
