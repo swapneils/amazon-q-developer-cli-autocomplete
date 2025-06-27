@@ -444,6 +444,10 @@ pub struct ChatSession {
     pending_tool_index: Option<usize>,
     /// State to track tools that need confirmation.
     tool_permissions: ToolPermissions,
+    /// Pending sampling requests that need user approval
+    pending_sampling_requests: Vec<crate::mcp_client::sampling_ipc::PendingSamplingRequest>,
+    /// Index of the sampling request currently awaiting approval
+    pending_sampling_index: Option<usize>,
     /// Telemetry events to be sent as part of the conversation.
     tool_use_telemetry_events: HashMap<String, ToolUseEventBuilder>,
     /// State used to keep track of tool use relation
@@ -540,6 +544,8 @@ impl ChatSession {
             conversation,
             tool_uses: vec![],
             pending_tool_index: None,
+            pending_sampling_requests: vec![],
+            pending_sampling_index: None,
             tool_use_telemetry_events: HashMap::new(),
             tool_use_status: ToolUseStatus::Idle,
             failed_request_ids: Vec::new(),
@@ -1187,6 +1193,35 @@ impl ChatSession {
             )?;
         }
 
+        let show_sampling_confirmation_dialog = !skip_printing_tools && self.pending_sampling_index.is_some();
+        if show_sampling_confirmation_dialog {
+            if let Some(index) = self.pending_sampling_index {
+                self.print_sampling_description(index, false).await?;
+            }
+            execute!(
+                self.stderr,
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("\nAllow this MCP sampling request? Use '"),
+                style::SetForegroundColor(Color::Green),
+                style::Print("t"),
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("' to trust (always allow) this server for sampling. ["),
+                style::SetForegroundColor(Color::Green),
+                style::Print("y"),
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("/"),
+                style::SetForegroundColor(Color::Green),
+                style::Print("n"),
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("/"),
+                style::SetForegroundColor(Color::Green),
+                style::Print("t"),
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("]:\n\n"),
+                style::SetForegroundColor(Color::Reset),
+            )?;
+        }
+
         // Do this here so that the skim integration sees an updated view of the context *during the current
         // q session*. (e.g., if I add files to context, that won't show up for skim for the current
         // q session unless we do this in prompt_user... unless you can find a better way)
@@ -1304,6 +1339,27 @@ impl ChatSession {
                     tool_use.accepted = true;
 
                     return Ok(ChatState::ExecuteTools);
+                }
+            } else if let Some(index) = self.pending_sampling_index {
+                // Check for a pending sampling approval
+                let is_trust = ["t", "T"].contains(&input);
+                if ["y", "Y"].contains(&input) || is_trust {
+                    let sampling_request = &mut self.pending_sampling_requests[index];
+                    if is_trust {
+                        // TODO: Add sampling server trust to ToolPermissions or create SamplingPermissions
+                        // For now, just approve this request
+                        tracing::info!(target: "mcp", "User trusted sampling server: {}", sampling_request.server_name);
+                    }
+                    sampling_request.approved = true;
+                    self.pending_sampling_index = None;
+
+                    // TODO: Resume the sampling request processing
+                    return Ok(ChatState::PromptUser { skip_printing_tools: false });
+                } else {
+                    // User rejected the sampling request
+                    self.pending_sampling_requests.remove(index);
+                    self.pending_sampling_index = None;
+                    return Ok(ChatState::PromptUser { skip_printing_tools: false });
                 }
             } else if !self.pending_prompts.is_empty() {
                 let prompts = self.pending_prompts.drain(0..).collect();
@@ -1941,6 +1997,39 @@ impl ChatSession {
             .queue_description(ctx, &mut self.stdout)
             .await
             .map_err(|e| ChatError::Custom(format!("failed to print tool, `{}`: {}", tool_use.name, e).into()))?;
+
+        Ok(())
+    }
+
+    async fn print_sampling_description(
+        &mut self,
+        sampling_index: usize,
+        trusted: bool,
+    ) -> Result<(), ChatError> {
+        let sampling_request = &self.pending_sampling_requests[sampling_index];
+
+        queue!(
+            self.stdout,
+            style::SetForegroundColor(Color::Cyan),
+            style::Print(format!(
+                "🤖 MCP Sampling Request: {}{}",
+                sampling_request.server_name,
+                if trusted { " (trusted)".dark_green() } else { "".reset() }
+            )),
+            style::SetForegroundColor(Color::Reset),
+            style::Print("\n"),
+            style::Print(CONTINUATION_LINE),
+            style::Print("\n"),
+            style::Print(TOOL_BULLET)
+        )?;
+
+        // Display the sampling request description
+        let description = sampling_request.get_description();
+        execute!(
+            self.stdout,
+            style::Print(description),
+            style::Print("\n")
+        )?;
 
         Ok(())
     }

@@ -718,93 +718,45 @@ where
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Request user approval via IPC
-        let approval_result = self.request_user_approval(
-            &prompt_content,
-            &sampling_request.system_prompt,
-            &sampling_request.model_preferences,
+        // Create a pending sampling request that will be handled by the chat system
+        let pending_request = crate::mcp_client::sampling_ipc::PendingSamplingRequest::new(
+            self.server_name.clone(),
+            prompt_content,
+            sampling_request.system_prompt.clone(),
+            sampling_request.model_preferences.clone(),
             sampling_request.max_tokens,
-            &sampling_request.include_context,
+            sampling_request.include_context.clone(),
             sampling_request.temperature,
-            &sampling_request.stop_sequences,
-            &sampling_request.metadata,
-        ).await?;
+            sampling_request.stop_sequences.clone(),
+            sampling_request.metadata.clone(),
+        );
 
-        if !approval_result.approved {
-            return Ok(JsonRpcResponse {
-                jsonrpc: JsonRpcVersion::default(),
-                id: request.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -1,
-                    message: approval_result.error_message.unwrap_or_else(|| "User rejected sampling request".to_string()),
-                    data: None,
-                }),
-            });
-        }
-
-        // Use approved/modified prompt
-        let final_prompt = approval_result.modified_prompt.unwrap_or(prompt_content);
+        // TODO: This is where we need to integrate with the chat system
+        // For now, return an error indicating that sampling approval is not yet fully implemented
+        tracing::warn!(target: "mcp", "Sampling approval integration with chat system not yet complete");
         
-        // Make LLM call (this would integrate with Q CLI's existing LLM client)
-        let llm_response = self.make_llm_call(&final_prompt, &sampling_request).await?;
-
         Ok(JsonRpcResponse {
             jsonrpc: JsonRpcVersion::default(),
             id: request.id,
-            result: Some(serde_json::to_value(llm_response)?),
-            error: None,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -1,
+                message: "Sampling approval system is being refactored - not yet available".to_string(),
+                data: None,
+            }),
         })
     }
 
-    /// Request user approval for sampling via IPC
-    async fn request_user_approval(
-        &self,
-        prompt_content: &str,
-        system_prompt: &Option<String>,
-        model_preferences: &Option<ModelPreferences>,
-        max_tokens: Option<u32>,
-        include_context: &Option<String>,
-        temperature: Option<f64>,
-        stop_sequences: &Option<Vec<String>>,
-        metadata: &Option<serde_json::Value>,
-    ) -> Result<SamplingApprovalResult, ClientError> {
-        use crate::mcp_client::sampling_ipc::{SamplingIpcHandler, SamplingIpcError};
-        
-        let ipc_handler = SamplingIpcHandler::new();
-        
-        // Try desktop app approval first
-        match ipc_handler.request_approval(
-            &self.server_name,
-            prompt_content,
-            system_prompt,
-            model_preferences,
-            max_tokens,
-            include_context,
-            temperature,
-            stop_sequences,
-            metadata,
-        ).await {
-            Ok(result) => Ok(result),
-            Err(SamplingIpcError::DesktopUnavailable) => {
-                // Fallback to terminal approval
-                tracing::warn!(target: "mcp", "Desktop app unavailable, falling back to terminal approval");
-                ipc_handler.request_terminal_approval(&self.server_name, prompt_content)
-                    .await
-                    .map_err(|e| ClientError::NegotiationError(format!("Terminal approval failed: {}", e)))
-            },
-            Err(e) => Err(ClientError::NegotiationError(format!("Sampling approval failed: {}", e))),
-        }
-    }
-
-    /// Make LLM call with approved prompt
+    /// Make LLM call with approved prompt - TODO: Implement real LLM integration
     async fn make_llm_call(
         &self,
         prompt: &str,
         request: &SamplingRequest,
     ) -> Result<SamplingResponse, ClientError> {
-        // This would integrate with Q CLI's existing LLM client
-        // For now, returning a mock response that acknowledges the new parameters
+        // TODO: This should integrate with Q CLI's existing LLM client
+        // For now, returning a placeholder response
+        tracing::warn!(target: "mcp", "make_llm_call not yet implemented - returning placeholder");
+        
         let model_hint = request.model_preferences
             .as_ref()
             .and_then(|prefs| prefs.hints.as_ref())
@@ -813,7 +765,7 @@ where
             .unwrap_or_else(|| "default-model".to_string());
             
         let response_text = format!(
-            "Mock response to: {} (model: {}, temp: {:?}, max_tokens: {:?}, context: {:?})",
+            "Placeholder response to: {} (model: {}, temp: {:?}, max_tokens: {:?}, context: {:?})",
             prompt,
             model_hint,
             request.temperature,
@@ -830,13 +782,6 @@ where
             stop_reason: "endTurn".to_string(),
         })
     }
-}
-
-#[derive(Debug)]
-pub struct SamplingApprovalResult {
-    pub approved: bool,
-    pub modified_prompt: Option<String>,
-    pub error_message: Option<String>,
 }
 
 fn examine_server_capabilities(ser_cap: &JsonRpcResponse) -> Result<(), ClientError> {

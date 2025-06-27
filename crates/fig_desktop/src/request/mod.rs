@@ -3,7 +3,6 @@ mod notifications;
 mod onboarding;
 mod process;
 mod properties;
-mod sampling;
 mod telemetry;
 mod user;
 mod window;
