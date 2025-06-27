@@ -249,7 +249,7 @@ impl ChatArgs {
         info!(?conversation_id, "Generated new conversation id");
         let (prompt_request_sender, prompt_request_receiver) = std::sync::mpsc::channel::<Option<String>>();
         let (prompt_response_sender, prompt_response_receiver) = std::sync::mpsc::channel::<Vec<String>>();
-        let mut tool_manager = ToolManagerBuilder::default()
+        let (mut tool_manager, sampling_receiver) = ToolManagerBuilder::default()
             .mcp_server_config(mcp_server_configs)
             .prompt_list_sender(prompt_response_sender)
             .prompt_list_receiver(prompt_request_receiver)
@@ -291,6 +291,7 @@ impl ChatArgs {
             tool_config,
             tool_permissions,
             !self.non_interactive,
+            sampling_receiver,
         )
         .await?
         .spawn(ctx, database, telemetry)
@@ -448,6 +449,8 @@ pub struct ChatSession {
     pending_sampling_requests: Vec<crate::mcp_client::sampling_ipc::PendingSamplingRequest>,
     /// Index of the sampling request currently awaiting approval
     pending_sampling_index: Option<usize>,
+    /// Channel receiver for incoming sampling requests from MCP servers
+    sampling_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::mcp_client::sampling_ipc::PendingSamplingRequest>,
     /// Telemetry events to be sent as part of the conversation.
     tool_use_telemetry_events: HashMap<String, ToolUseEventBuilder>,
     /// State used to keep track of tool use relation
@@ -479,6 +482,7 @@ impl ChatSession {
         tool_config: HashMap<String, ToolSpec>,
         tool_permissions: ToolPermissions,
         interactive: bool,
+        sampling_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::mcp_client::sampling_ipc::PendingSamplingRequest>,
     ) -> Result<Self> {
         let valid_model_id = model_id
             .or_else(|| {
@@ -546,6 +550,7 @@ impl ChatSession {
             pending_tool_index: None,
             pending_sampling_requests: vec![],
             pending_sampling_index: None,
+            sampling_receiver,
             tool_use_telemetry_events: HashMap::new(),
             tool_use_status: ToolUseStatus::Idle,
             failed_request_ids: Vec::new(),
@@ -1243,6 +1248,19 @@ impl ChatSession {
                 .put_skim_command_selector(database, Arc::new(context_manager.clone()), tool_names);
         }
 
+        // Check for incoming sampling requests
+        while let Ok(sampling_request) = self.sampling_receiver.try_recv() {
+            tracing::info!(target: "mcp", "Received sampling request from: {}", sampling_request.server_name);
+            self.pending_sampling_requests.push(sampling_request);
+            
+            // If no sampling request is currently being processed, start processing this one
+            if self.pending_sampling_index.is_none() {
+                self.pending_sampling_index = Some(self.pending_sampling_requests.len() - 1);
+                // Return to prompt user with the sampling dialog
+                return Ok(ChatState::PromptUser { skip_printing_tools: false });
+            }
+        }
+
         execute!(
             self.stderr,
             style::SetForegroundColor(Color::Reset),
@@ -1344,20 +1362,31 @@ impl ChatSession {
                 // Check for a pending sampling approval
                 let is_trust = ["t", "T"].contains(&input);
                 if ["y", "Y"].contains(&input) || is_trust {
-                    let sampling_request = &mut self.pending_sampling_requests[index];
+                    let mut sampling_request = self.pending_sampling_requests.remove(index);
                     if is_trust {
                         // TODO: Add sampling server trust to ToolPermissions or create SamplingPermissions
                         // For now, just approve this request
                         tracing::info!(target: "mcp", "User trusted sampling server: {}", sampling_request.server_name);
                     }
-                    sampling_request.approved = true;
+                    
+                    // Send approval result back to MCP client
+                    sampling_request.send_approval_result(
+                        crate::mcp_client::sampling_ipc::SamplingApprovalResult::approved()
+                    );
+                    
                     self.pending_sampling_index = None;
-
-                    // TODO: Resume the sampling request processing
                     return Ok(ChatState::PromptUser { skip_printing_tools: false });
                 } else {
                     // User rejected the sampling request
-                    self.pending_sampling_requests.remove(index);
+                    let mut sampling_request = self.pending_sampling_requests.remove(index);
+                    
+                    // Send rejection result back to MCP client
+                    sampling_request.send_approval_result(
+                        crate::mcp_client::sampling_ipc::SamplingApprovalResult::rejected(
+                            "User rejected the sampling request".to_string()
+                        )
+                    );
+                    
                     self.pending_sampling_index = None;
                     return Ok(ChatState::PromptUser { skip_printing_tools: false });
                 }
@@ -2313,6 +2342,12 @@ mod tests {
     use super::*;
     use crate::platform::Env;
 
+    #[cfg(test)]
+    fn create_dummy_sampling_receiver() -> tokio::sync::mpsc::UnboundedReceiver<crate::mcp_client::sampling_ipc::PendingSamplingRequest> {
+        let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        receiver
+    }
+
     #[tokio::test]
     async fn test_flow() {
         let mut ctx = Context::new();
@@ -2362,6 +2397,7 @@ mod tests {
             tool_config,
             ToolPermissions::new(0),
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
@@ -2510,6 +2546,7 @@ mod tests {
             tool_config,
             ToolPermissions::new(0),
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
@@ -2611,6 +2648,7 @@ mod tests {
             tool_config,
             ToolPermissions::new(0),
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
@@ -2691,6 +2729,7 @@ mod tests {
             tool_config,
             ToolPermissions::new(0),
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
@@ -2745,6 +2784,7 @@ mod tests {
             tool_config,
             ToolPermissions::new(0),
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()

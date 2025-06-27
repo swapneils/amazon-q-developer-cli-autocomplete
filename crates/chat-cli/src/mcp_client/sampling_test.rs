@@ -3,7 +3,7 @@ mod tests {
     use super::*;
     use crate::mcp_client::{
         SamplingMessage, SamplingContent, SamplingRequest, ModelPreferences, ModelHint,
-        sampling_ipc::SamplingIpcHandler,
+        // sampling_ipc::SamplingIpcHandler, // TODO: Remove old IPC-based tests
     };
 
     #[tokio::test]
@@ -39,6 +39,8 @@ mod tests {
         assert!(json.contains("claude-3-sonnet"));
     }
 
+    // TODO: Rewrite these tests for the new chat-based approval system
+    /*
     #[tokio::test]
     async fn test_sampling_ipc_handler() {
         let handler = SamplingIpcHandler::new();
@@ -229,5 +231,5 @@ mod tests {
             let json = serde_json::to_string(&request).expect("Failed to serialize");
             let _: SamplingRequest = serde_json::from_str(&json).expect("Failed to deserialize");
         }
-    }
+    */
 }

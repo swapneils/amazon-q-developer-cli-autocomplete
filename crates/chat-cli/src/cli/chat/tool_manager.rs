@@ -256,7 +256,7 @@ impl ToolManagerBuilder {
         telemetry: &TelemetryThread,
         mut output: Box<dyn Write + Send + Sync + 'static>,
         interactive: bool,
-    ) -> eyre::Result<ToolManager> {
+    ) -> eyre::Result<(ToolManager, tokio::sync::mpsc::UnboundedReceiver<crate::mcp_client::sampling_ipc::PendingSamplingRequest>)> {
         let McpServerConfig { mcp_servers } = self.mcp_server_config.ok_or(eyre::eyre!("Missing mcp server config"))?;
         debug_assert!(self.conversation_id.is_some());
         let conversation_id = self.conversation_id.ok_or(eyre::eyre!("Missing conversation id"))?;
@@ -277,12 +277,19 @@ impl ToolManagerBuilder {
             })
             .collect();
 
+        // Create channel for sampling requests
+        let (sampling_sender, sampling_receiver) = tokio::sync::mpsc::unbounded_channel();
+
         let pre_initialized = enabled_servers
             .into_iter()
             .map(|(server_name, server_config)| {
                 let snaked_cased_name = server_name.to_case(convert_case::Case::Snake);
                 let sanitized_server_name = sanitize_name(snaked_cased_name, &regex, &mut hasher);
-                let custom_tool_client = CustomToolClient::from_config(sanitized_server_name.clone(), server_config);
+                let custom_tool_client = CustomToolClient::from_config(
+                    sanitized_server_name.clone(), 
+                    server_config,
+                    Some(sampling_sender.clone()),
+                );
                 (sanitized_server_name, custom_tool_client)
             })
             .collect::<Vec<(String, _)>>();
@@ -687,7 +694,7 @@ impl ToolManagerBuilder {
             });
         }
 
-        Ok(ToolManager {
+        let tool_manager = ToolManager {
             conversation_id,
             clients,
             prompts,
@@ -699,8 +706,11 @@ impl ToolManagerBuilder {
             is_interactive: interactive,
             mcp_load_record: load_record,
             disabled_servers: disabled_servers_display,
+            sampling_request_sender: Some(sampling_sender),
             ..Default::default()
-        })
+        };
+
+        Ok((tool_manager, sampling_receiver))
     }
 }
 
@@ -789,6 +799,9 @@ pub struct ToolManager {
     /// The value is the load message (i.e. load time, warnings, and errors)
     pub mcp_load_record: Arc<Mutex<HashMap<String, Vec<LoadingRecord>>>>,
 
+    /// Channel sender for MCP clients to send sampling requests for approval
+    pub sampling_request_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::mcp_client::sampling_ipc::PendingSamplingRequest>>,
+
     /// List of disabled MCP server names for display purposes
     disabled_servers: Vec<String>,
 }
@@ -806,6 +819,7 @@ impl Clone for ToolManager {
             is_interactive: self.is_interactive,
             mcp_load_record: self.mcp_load_record.clone(),
             disabled_servers: self.disabled_servers.clone(),
+            sampling_request_sender: self.sampling_request_sender.clone(),
             ..Default::default()
         }
     }

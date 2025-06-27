@@ -61,7 +61,11 @@ pub enum CustomToolClient {
 
 impl CustomToolClient {
     // TODO: add support for http transport
-    pub fn from_config(server_name: String, config: CustomToolConfig) -> Result<Self> {
+    pub fn from_config(
+        server_name: String, 
+        config: CustomToolConfig,
+        sampling_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::mcp_client::sampling_ipc::PendingSamplingRequest>>,
+    ) -> Result<Self> {
         let CustomToolConfig {
             command,
             args,
@@ -79,6 +83,7 @@ impl CustomToolClient {
                "version": "1.0.0"
             }),
             env,
+            sampling_sender,
         };
         let client = McpClient::<JsonRpcStdioTransport>::from_config(mcp_client_config)?;
         Ok(CustomToolClient::Stdio {

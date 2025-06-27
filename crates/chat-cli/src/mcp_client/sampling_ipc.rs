@@ -1,7 +1,7 @@
 use crate::mcp_client::ModelPreferences;
 
 /// Represents a pending sampling request that needs user approval
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PendingSamplingRequest {
     pub server_name: String,
     pub prompt_content: String,
@@ -13,6 +13,8 @@ pub struct PendingSamplingRequest {
     pub stop_sequences: Option<Vec<String>>,
     pub metadata: Option<serde_json::Value>,
     pub approved: bool,
+    /// Channel to send approval result back to MCP client
+    pub response_sender: Option<tokio::sync::oneshot::Sender<SamplingApprovalResult>>,
 }
 
 impl PendingSamplingRequest {
@@ -26,6 +28,7 @@ impl PendingSamplingRequest {
         temperature: Option<f64>,
         stop_sequences: Option<Vec<String>>,
         metadata: Option<serde_json::Value>,
+        response_sender: tokio::sync::oneshot::Sender<SamplingApprovalResult>,
     ) -> Self {
         Self {
             server_name,
@@ -38,6 +41,7 @@ impl PendingSamplingRequest {
             stop_sequences,
             metadata,
             approved: false,
+            response_sender: Some(response_sender),
         }
     }
 
@@ -72,6 +76,15 @@ impl PendingSamplingRequest {
         }
         
         desc
+    }
+
+    /// Send approval result back to MCP client
+    pub fn send_approval_result(&mut self, result: SamplingApprovalResult) {
+        if let Some(sender) = self.response_sender.take() {
+            if let Err(_) = sender.send(result) {
+                tracing::warn!(target: "mcp", "Failed to send sampling approval result - receiver may have been dropped");
+            }
+        }
     }
 
     /// Check if this sampling request should be trusted based on server name

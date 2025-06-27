@@ -141,6 +141,8 @@ pub struct ClientConfig {
     pub timeout: u64,
     pub client_info: serde_json::Value,
     pub env: Option<HashMap<String, String>>,
+    #[serde(skip)]
+    pub sampling_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::mcp_client::sampling_ipc::PendingSamplingRequest>>,
 }
 
 #[allow(dead_code)]
@@ -190,6 +192,7 @@ pub struct Client<T: Transport> {
     // TODO: move this to tool manager that way all the assets are treated equally
     pub prompt_gets: Arc<SyncRwLock<HashMap<String, PromptGet>>>,
     pub is_prompts_out_of_date: Arc<AtomicBool>,
+    sampling_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::mcp_client::sampling_ipc::PendingSamplingRequest>>,
 }
 
 impl<T: Transport> Clone for Client<T> {
@@ -206,6 +209,7 @@ impl<T: Transport> Clone for Client<T> {
             messenger: None,
             prompt_gets: self.prompt_gets.clone(),
             is_prompts_out_of_date: self.is_prompts_out_of_date.clone(),
+            sampling_sender: self.sampling_sender.clone(),
         }
     }
 }
@@ -219,6 +223,7 @@ impl Client<StdioTransport> {
             timeout,
             client_info,
             env,
+            sampling_sender,
         } = config;
         let child = {
             let expanded_bin_path = shellexpand::tilde(&bin_path);
@@ -267,6 +272,7 @@ impl Client<StdioTransport> {
             messenger: None,
             prompt_gets: Arc::new(SyncRwLock::new(HashMap::new())),
             is_prompts_out_of_date: Arc::new(AtomicBool::new(false)),
+            sampling_sender,
         })
     }
 
@@ -718,6 +724,9 @@ where
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Create a oneshot channel for receiving approval result
+        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+
         // Create a pending sampling request that will be handled by the chat system
         let pending_request = crate::mcp_client::sampling_ipc::PendingSamplingRequest::new(
             self.server_name.clone(),
@@ -729,22 +738,89 @@ where
             sampling_request.temperature,
             sampling_request.stop_sequences.clone(),
             sampling_request.metadata.clone(),
+            response_sender,
         );
 
-        // TODO: This is where we need to integrate with the chat system
-        // For now, return an error indicating that sampling approval is not yet fully implemented
-        tracing::warn!(target: "mcp", "Sampling approval integration with chat system not yet complete");
-        
-        Ok(JsonRpcResponse {
-            jsonrpc: JsonRpcVersion::default(),
-            id: request.id,
-            result: None,
-            error: Some(JsonRpcError {
-                code: -1,
-                message: "Sampling approval system is being refactored - not yet available".to_string(),
-                data: None,
-            }),
-        })
+        // Send the request through the channel for approval
+        if let Some(ref sender) = self.sampling_sender {
+            if let Err(e) = sender.send(pending_request) {
+                tracing::error!(target: "mcp", "Failed to send sampling request for approval: {}", e);
+                return Ok(JsonRpcResponse {
+                    jsonrpc: JsonRpcVersion::default(),
+                    id: request.id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32603,
+                        message: "Failed to queue sampling request for approval".to_string(),
+                        data: None,
+                    }),
+                });
+            }
+        } else {
+            tracing::warn!(target: "mcp", "No sampling sender available - sampling requests not supported");
+            return Ok(JsonRpcResponse {
+                jsonrpc: JsonRpcVersion::default(),
+                id: request.id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32601,
+                    message: "Sampling requests not supported in this configuration".to_string(),
+                    data: None,
+                }),
+            });
+        }
+
+        // Wait for approval result from chat session
+        match response_receiver.await {
+            Ok(approval_result) => {
+                if approval_result.approved {
+                    tracing::info!(target: "mcp", "Sampling request approved by user");
+                    
+                    // TODO: Make the actual LLM call here
+                    // For now, return a placeholder response
+                    tracing::warn!(target: "mcp", "LLM call implementation not yet complete");
+                    
+                    Ok(JsonRpcResponse {
+                        jsonrpc: JsonRpcVersion::default(),
+                        id: request.id,
+                        result: Some(serde_json::json!({
+                            "model": "placeholder",
+                            "role": "assistant", 
+                            "content": {
+                                "type": "text",
+                                "text": "Sampling request was approved but LLM call implementation is pending"
+                            }
+                        })),
+                        error: None,
+                    })
+                } else {
+                    tracing::info!(target: "mcp", "Sampling request rejected by user");
+                    Ok(JsonRpcResponse {
+                        jsonrpc: JsonRpcVersion::default(),
+                        id: request.id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32000,
+                            message: approval_result.error_message.unwrap_or_else(|| "User rejected sampling request".to_string()),
+                            data: None,
+                        }),
+                    })
+                }
+            }
+            Err(_) => {
+                tracing::error!(target: "mcp", "Failed to receive approval result - channel closed");
+                Ok(JsonRpcResponse {
+                    jsonrpc: JsonRpcVersion::default(),
+                    id: request.id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32603,
+                        message: "Internal error: approval channel closed".to_string(),
+                        data: None,
+                    }),
+                })
+            }
+        }
     }
 
     /// Make LLM call with approved prompt - TODO: Implement real LLM integration
