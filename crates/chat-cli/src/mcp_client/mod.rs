@@ -15,7 +15,6 @@ mod integration_tests;
 pub use client::*;
 pub use facilitator_types::*;
 pub use messenger::*;
-pub use sampling_ipc::*;
 #[allow(unused_imports)]
 pub use server::*;
 pub use transport::*;

@@ -1,26 +1,11 @@
 #[cfg(test)]
 mod integration_tests {
-    use super::*;
     use crate::mcp_client::{
-        Client, ClientConfig, ClientInfo, StdioTransport,
         SamplingMessage, SamplingContent, SamplingRequest, ModelPreferences, ModelHint,
-        // sampling_ipc::SamplingIpcHandler, // TODO: Remove old IPC-based tests
     };
-    use tokio::time::{timeout, Duration};
 
-    // TODO: Rewrite these tests for the new chat-based approval system
-    /*
-    /// Test complete sampling workflow integration
     #[tokio::test]
-    async fn test_complete_sampling_workflow() {
-        // This test would require a real MCP server, but demonstrates the approach
-        let _client_info = serde_json::json!({
-            "name": "test-client",
-            "version": "1.0.0"
-        });
-
-        // In a real test, this would connect to an actual MCP server
-        // For now, we test the client-side logic
+    async fn test_sampling_request_serialization() {
         let sampling_request = SamplingRequest {
             messages: vec![
                 SamplingMessage {
@@ -31,17 +16,22 @@ mod integration_tests {
                 }
             ],
             model_preferences: Some(ModelPreferences {
-                hints: Some(vec![ModelHint { name: "gpt-4".to_string() }]),
-                cost_priority: Some(0.5),
-                speed_priority: Some(0.7),
-                intelligence_priority: Some(0.8),
+                hints: Some(vec![
+                    ModelHint { name: "claude-3-sonnet".to_string() }
+                ]),
+                cost_priority: Some(0.3),
+                speed_priority: Some(0.8),
+                intelligence_priority: Some(0.5),
             }),
             system_prompt: Some("You are a helpful weather assistant.".to_string()),
             max_tokens: Some(150),
             include_context: Some("thisServer".to_string()),
-            temperature: Some(0.8),
+            temperature: Some(0.7),
             stop_sequences: Some(vec!["END".to_string()]),
-            metadata: Some(serde_json::json!({"test": "integration"})),
+            metadata: Some(serde_json::json!({
+                "request_id": "weather_test_001",
+                "priority": "normal"
+            })),
         };
 
         // Test serialization/deserialization
@@ -49,203 +39,13 @@ mod integration_tests {
         let deserialized: SamplingRequest = serde_json::from_str(&json).expect("Failed to deserialize");
         
         assert_eq!(deserialized.messages.len(), 1);
-        assert!(deserialized.model_preferences.is_some());
+        assert_eq!(deserialized.messages[0].role, "user");
+        assert!(matches!(deserialized.messages[0].content, SamplingContent::Text { .. }));
         assert_eq!(deserialized.max_tokens, Some(150));
+        assert_eq!(deserialized.temperature, Some(0.7));
+        assert!(deserialized.metadata.is_some());
     }
 
-    /// Test IPC handler with various approval scenarios
-    #[tokio::test]
-    async fn test_ipc_approval_scenarios() {
-        let handler = SamplingIpcHandler::new();
-
-        // Test 1: Simple approval
-        let result = handler.request_approval(
-            "weather-server",
-            "What's the weather?",
-            &Some("You are a weather assistant.".to_string()),
-            &Some(ModelPreferences {
-                hints: Some(vec![ModelHint { name: "gpt-4".to_string() }]),
-                cost_priority: Some(0.5),
-                speed_priority: Some(0.5),
-                intelligence_priority: Some(0.8),
-            }),
-            Some(100),
-            &Some("thisServer".to_string()),
-            Some(0.7),
-            &None,
-            &None,
-        ).await;
-
-        assert!(result.is_ok());
-        let approval = result.unwrap();
-        assert!(approval.approved);
-
-        // Test 2: Rejection scenario
-        let result = handler.request_approval(
-            "suspicious-server",
-            &"dangerous content".repeat(200), // Long suspicious content
-            &None,
-            &None,
-            None,
-            &None,
-            None,
-            &None,
-            &None,
-        ).await;
-
-        assert!(result.is_ok());
-        let approval = result.unwrap();
-        assert!(!approval.approved);
-        assert!(approval.error_message.is_some());
-    }
-
-    /// Test concurrent sampling requests
-    #[tokio::test]
-    async fn test_concurrent_sampling_requests() {
-        let handler = SamplingIpcHandler::new();
-        
-        // Create multiple concurrent requests
-        let mut handles = vec![];
-        
-        for i in 0..5 {
-            let handler_clone = SamplingIpcHandler::new();
-            let handle = tokio::spawn(async move {
-                handler_clone.request_approval(
-                    &format!("server-{}", i),
-                    &format!("Request {} content", i),
-                    &None,
-                    &None,
-                    Some(50),
-                    &None,
-                    None,
-                    &None,
-                    &None,
-                ).await
-            });
-            handles.push(handle);
-        }
-
-        // Wait for all requests to complete
-        let results = futures::future::join_all(handles).await;
-        
-        // Verify all requests completed successfully
-        for result in results {
-            assert!(result.is_ok());
-            let approval_result = result.unwrap();
-            assert!(approval_result.is_ok());
-        }
-    }
-
-    /// Test timeout scenarios
-    #[tokio::test]
-    async fn test_approval_timeout() {
-        let handler = SamplingIpcHandler::new();
-        
-        // Test with a very short timeout to simulate timeout scenario
-        let result = timeout(
-            Duration::from_millis(1), // Very short timeout
-            handler.request_approval(
-                "slow-server",
-                "This request should timeout",
-                &None,
-                &None,
-                None,
-                &None,
-                None,
-                &None,
-                &None,
-            )
-        ).await;
-
-        // The timeout should trigger before the request completes
-        // In a real implementation, this would test actual timeout handling
-        assert!(result.is_err() || result.unwrap().is_ok());
-    }
-
-    /// Test terminal fallback mechanism
-    #[tokio::test]
-    async fn test_terminal_fallback() {
-        let handler = SamplingIpcHandler::new();
-        
-        let result = handler.request_terminal_approval(
-            "fallback-server",
-            "Terminal approval test",
-        ).await;
-
-        assert!(result.is_ok());
-        let approval = result.unwrap();
-        assert!(approval.approved); // Terminal fallback should approve
-    }
-
-    /// Test security validation
-    #[tokio::test]
-    async fn test_security_validation() {
-        let handler = SamplingIpcHandler::new();
-
-        // Test various potentially malicious inputs
-        let long_input = "A".repeat(10000);
-        let malicious_inputs = vec![
-            "javascript:alert('xss')",
-            "<script>alert('xss')</script>",
-            "'; DROP TABLE users; --",
-            "\x00\x01\x02\x03", // Binary data
-            &long_input, // Very long input
-        ];
-
-        for input in malicious_inputs {
-            let result = handler.request_approval(
-                "security-test-server",
-                input,
-                &None,
-                &None,
-                None,
-                &None,
-                None,
-                &None,
-                &None,
-            ).await;
-
-            // Should either reject or handle safely
-            assert!(result.is_ok());
-            // In a real implementation, malicious content should be rejected
-        }
-    }
-
-    /// Test model preferences validation
-    #[tokio::test]
-    async fn test_model_preferences_validation() {
-        // Test valid preferences
-        let valid_prefs = ModelPreferences {
-            hints: Some(vec![
-                ModelHint { name: "gpt-4".to_string() },
-                ModelHint { name: "claude-3".to_string() },
-            ]),
-            cost_priority: Some(0.5),
-            speed_priority: Some(0.7),
-            intelligence_priority: Some(0.9),
-        };
-
-        let json = serde_json::to_string(&valid_prefs).expect("Valid preferences should serialize");
-        let deserialized: ModelPreferences = serde_json::from_str(&json)
-            .expect("Valid preferences should deserialize");
-
-        assert_eq!(deserialized.hints.as_ref().unwrap().len(), 2);
-        assert_eq!(deserialized.cost_priority, Some(0.5));
-
-        // Test edge cases
-        let edge_prefs = ModelPreferences {
-            hints: None,
-            cost_priority: Some(0.0),
-            speed_priority: Some(1.0),
-            intelligence_priority: None,
-        };
-
-        let json = serde_json::to_string(&edge_prefs).expect("Edge case preferences should serialize");
-        let _: ModelPreferences = serde_json::from_str(&json)
-            .expect("Edge case preferences should deserialize");
-    }
-
-    /// Test error handling and recovery
     #[tokio::test]
     async fn test_error_handling() {
         // Test JSON parsing errors
@@ -264,5 +64,102 @@ mod integration_tests {
         let result: Result<SamplingContent, _> = serde_json::from_str(invalid_content);
         assert!(result.is_err());
     }
-    */
+
+    #[tokio::test]
+    async fn test_chat_based_sampling_workflow() {
+        use crate::mcp_client::sampling_ipc::{PendingSamplingRequest, SamplingApprovalResult};
+        
+        // Test the new chat-based sampling workflow components
+        let (approval_sender, approval_receiver) = tokio::sync::oneshot::channel();
+
+        // Create a pending sampling request
+        let pending_request = PendingSamplingRequest::new(
+            "test-server".to_string(),
+            "What is the meaning of life?".to_string(),
+            Some("You are a philosophical assistant.".to_string()),
+            Some(ModelPreferences {
+                hints: Some(vec![ModelHint { name: "claude-3-sonnet".to_string() }]),
+                cost_priority: Some(0.5),
+                speed_priority: Some(0.5),
+                intelligence_priority: Some(0.9),
+            }),
+            Some(200),
+            Some("thisServer".to_string()),
+            Some(0.8),
+            Some(vec!["END".to_string(), "STOP".to_string()]),
+            Some(serde_json::json!({"philosophical": true})),
+            approval_sender,
+        );
+        
+        // Verify the request structure
+        assert_eq!(pending_request.server_name, "test-server");
+        assert!(pending_request.prompt_content.contains("meaning of life"));
+        assert_eq!(pending_request.max_tokens, Some(200));
+        assert_eq!(pending_request.temperature, Some(0.8));
+        
+        // Test description generation
+        let description = pending_request.get_description();
+        assert!(description.contains("test-server"));
+        assert!(description.contains("meaning of life"));
+        assert!(description.contains("philosophical assistant"));
+        assert!(description.contains("Max tokens: 200"));
+        assert!(description.contains("Temperature: 0.8"));
+        
+        // Simulate approval workflow
+        tokio::spawn(async move {
+            // Simulate user approval after a short delay
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            let _ = approval_receiver.await;
+        });
+        
+        // In a real scenario, the chat session would send the approval result
+        // For this test, we just verify the channel works
+        assert!(pending_request.response_sender.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_sampling_requests() {
+        use crate::mcp_client::sampling_ipc::{PendingSamplingRequest, SamplingApprovalResult};
+        
+        // Test handling multiple concurrent sampling requests
+        let mut handles = Vec::new();
+        
+        for i in 0..3 {
+            let handle = tokio::spawn(async move {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                
+                let mut pending_request = PendingSamplingRequest::new(
+                    format!("test-server-{}", i),
+                    format!("Question number {}", i),
+                    Some("You are a test assistant.".to_string()),
+                    None,
+                    Some(100),
+                    Some("thisServer".to_string()),
+                    Some(0.7),
+                    None,
+                    Some(serde_json::json!({"request_id": i})),
+                    sender,
+                );
+                
+                // Simulate approval
+                pending_request.send_approval_result(SamplingApprovalResult::approved());
+                
+                // Verify the result
+                let result = receiver.await.expect("Failed to receive approval");
+                assert!(result.approved);
+                
+                i
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all requests to complete
+        let results = futures::future::join_all(handles).await;
+        
+        // Verify all requests completed successfully
+        for (i, result) in results.into_iter().enumerate() {
+            assert_eq!(result.unwrap(), i);
+        }
+    }
 }

@@ -1009,6 +1009,7 @@ mod tests {
                 map.insert("ENV_TWO".to_owned(), "2".to_owned());
                 Some(map)
             },
+            sampling_sender: None,
         };
         let client_info_two = serde_json::json!({
           "name": "TestClientTwo",
@@ -1026,6 +1027,7 @@ mod tests {
                 map.insert("ENV_TWO".to_owned(), "2".to_owned());
                 Some(map)
             },
+            sampling_sender: None,
         };
         let mut client_one = Client::<StdioTransport>::from_config(client_config_one).expect("Failed to create client");
         let mut client_two = Client::<StdioTransport>::from_config(client_config_two).expect("Failed to create client");

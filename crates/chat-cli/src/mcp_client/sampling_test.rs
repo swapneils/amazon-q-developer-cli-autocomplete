@@ -1,9 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::mcp_client::{
         SamplingMessage, SamplingContent, SamplingRequest, ModelPreferences, ModelHint,
-        // sampling_ipc::SamplingIpcHandler, // TODO: Remove old IPC-based tests
     };
 
     #[tokio::test]
@@ -37,72 +35,6 @@ mod tests {
         let json = serde_json::to_string(&request).expect("Failed to serialize sampling request");
         assert!(json.contains("What is the capital of France?"));
         assert!(json.contains("claude-3-sonnet"));
-    }
-
-    // TODO: Rewrite these tests for the new chat-based approval system
-    /*
-    #[tokio::test]
-    async fn test_sampling_ipc_handler() {
-        let handler = SamplingIpcHandler::new();
-        
-        let result = handler.request_approval(
-            "test-server",
-            "What is 2+2?",
-            &Some("You are a math assistant.".to_string()),
-            &Some(ModelPreferences {
-                hints: Some(vec![ModelHint { name: "gpt-4".to_string() }]),
-                cost_priority: Some(0.5),
-                speed_priority: Some(0.5),
-                intelligence_priority: Some(0.8),
-            }),
-            Some(50),
-            &Some("thisServer".to_string()),
-            Some(0.7),
-            &Some(vec!["STOP".to_string()]),
-            &Some(serde_json::json!({"test": true})),
-        ).await;
-
-        assert!(result.is_ok());
-        let approval = result.unwrap();
-        assert!(approval.approved); // Should be approved for simple math question
-        assert!(approval.error_message.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_sampling_ipc_rejection() {
-        let handler = SamplingIpcHandler::new();
-        
-        // Test with content that should be rejected
-        let result = handler.request_approval(
-            "test-server",
-            &"dangerous".repeat(100), // Long dangerous content
-            &None,
-            &None,
-            None,
-            &None,
-            None,
-            &None,
-            &None,
-        ).await;
-
-        assert!(result.is_ok());
-        let approval = result.unwrap();
-        assert!(!approval.approved); // Should be rejected
-        assert!(approval.error_message.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_terminal_fallback() {
-        let handler = SamplingIpcHandler::new();
-        
-        let result = handler.request_terminal_approval(
-            "test-server",
-            "Simple question for terminal approval",
-        ).await;
-
-        assert!(result.is_ok());
-        let approval = result.unwrap();
-        assert!(approval.approved); // Terminal fallback should approve
     }
 
     #[tokio::test]
@@ -231,5 +163,62 @@ mod tests {
             let json = serde_json::to_string(&request).expect("Failed to serialize");
             let _: SamplingRequest = serde_json::from_str(&json).expect("Failed to deserialize");
         }
-    */
+    }
+
+    #[tokio::test]
+    async fn test_pending_sampling_request() {
+        use crate::mcp_client::sampling_ipc::{PendingSamplingRequest, SamplingApprovalResult};
+
+        // Create a oneshot channel for testing
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        let mut pending_request = PendingSamplingRequest::new(
+            "test-server".to_string(),
+            "What is 2+2?".to_string(),
+            Some("You are a math assistant.".to_string()),
+            Some(ModelPreferences {
+                hints: Some(vec![ModelHint { name: "claude-3".to_string() }]),
+                cost_priority: Some(0.5),
+                speed_priority: Some(0.5),
+                intelligence_priority: Some(0.8),
+            }),
+            Some(50),
+            Some("thisServer".to_string()),
+            Some(0.7),
+            Some(vec!["STOP".to_string()]),
+            Some(serde_json::json!({"test": true})),
+            sender,
+        );
+
+        // Test the description generation
+        let description = pending_request.get_description();
+        assert!(description.contains("test-server"));
+        assert!(description.contains("What is 2+2?"));
+        assert!(description.contains("You are a math assistant"));
+        assert!(description.contains("Max tokens: 50"));
+        assert!(description.contains("Temperature: 0.7"));
+        
+        // Test sending approval result
+        pending_request.send_approval_result(SamplingApprovalResult::approved());
+
+        // Verify the result was received
+        let result = receiver.await.expect("Failed to receive approval result");
+        assert!(result.approved);
+        assert!(result.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sampling_approval_result() {
+        use crate::mcp_client::sampling_ipc::SamplingApprovalResult;
+
+        // Test approved result
+        let approved = SamplingApprovalResult::approved();
+        assert!(approved.approved);
+        assert!(approved.error_message.is_none());
+
+        // Test rejected result
+        let rejected = SamplingApprovalResult::rejected("User declined".to_string());
+        assert!(!rejected.approved);
+        assert_eq!(rejected.error_message, Some("User declined".to_string()));
+    }
 }
