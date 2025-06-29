@@ -53,6 +53,7 @@ pub const COMMANDS: &[&str] = &[
     "/tools trustall",
     "/tools reset",
     "/mcp",
+    "/mcp reload",
     "/model",
     "/profile",
     "/profile help",

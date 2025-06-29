@@ -1263,6 +1263,111 @@ impl ToolManager {
     pub async fn pending_clients(&self) -> Vec<String> {
         self.pending_clients.read().await.iter().cloned().collect::<Vec<_>>()
     }
+
+    /// Reload a specific MCP server by name
+    pub async fn reload_server(&mut self, server_name: &str) -> eyre::Result<()> {
+        // Check if the server exists
+        if !self.clients.contains_key(server_name) {
+            return Err(eyre::eyre!("Server '{}' not found", server_name));
+        }
+
+        // Load current configuration
+        let mut stderr = std::io::stderr();
+        let config = McpServerConfig::load_config(&mut stderr).await?;
+
+        // Find the server config
+        let server_config = config
+            .mcp_servers
+            .get(server_name)
+            .ok_or_else(|| eyre::eyre!("Server '{}' not found in configuration", server_name))?;
+
+        // Clone server_name to avoid partial move issues
+        let server_name_owned = server_name.to_string();
+
+        // Remove the old client (this will trigger Drop and terminate the process)
+        self.clients.remove(&server_name_owned);
+
+        // Remove from pending clients if it was there
+        self.pending_clients.write().await.remove(&server_name_owned);
+
+        // Clear any existing load records for this server
+        self.mcp_load_record.lock().await.remove(&server_name_owned);
+
+        // Create new CustomToolClient using the correct constructor
+        let custom_tool_client = match CustomToolClient::from_config(server_name_owned.clone(), server_config.clone()) {
+            Ok(client) => client,
+            Err(e) => {
+                return Err(eyre::eyre!(
+                    "Failed to create client for '{}': {}",
+                    server_name_owned,
+                    e
+                ));
+            },
+        };
+
+        // Add to pending clients
+        self.pending_clients.write().await.insert(server_name_owned.clone());
+
+        // Initialize the client
+        let client_arc = Arc::new(custom_tool_client);
+        match client_arc.init().await {
+            Ok(_capabilities) => {
+                // Remove from pending and add to active clients
+                self.pending_clients.write().await.remove(&server_name_owned);
+                self.clients.insert(server_name_owned.clone(), client_arc);
+
+                // Record successful reload
+                self.mcp_load_record
+                    .lock()
+                    .await
+                    .insert(server_name_owned.clone(), vec![
+                        crate::cli::chat::tool_manager::LoadingRecord::Success(format!(
+                            "Server '{}' reloaded successfully",
+                            server_name_owned
+                        )),
+                    ]);
+
+                // Mark that we have new tools to update
+                self.has_new_stuff.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+            Err(e) => {
+                // Remove from pending clients
+                self.pending_clients.write().await.remove(&server_name_owned);
+
+                // Record the error
+                self.mcp_load_record
+                    .lock()
+                    .await
+                    .insert(server_name_owned.clone(), vec![
+                        crate::cli::chat::tool_manager::LoadingRecord::Err(format!(
+                            "Failed to initialize reloaded server '{}': {}",
+                            server_name_owned, e
+                        )),
+                    ]);
+
+                return Err(eyre::eyre!(
+                    "Failed to initialize reloaded server '{}': {}",
+                    server_name_owned,
+                    e
+                ));
+            },
+        }
+
+        Ok(())
+    }
+
+    /// Reload all MCP servers
+    pub async fn reload_all_servers(&mut self) -> eyre::Result<Vec<(String, eyre::Result<()>)>> {
+        let server_names: Vec<String> = self.clients.keys().cloned().collect();
+        let mut results = Vec::new();
+
+        for server_name in server_names {
+            let result = self.reload_server(&server_name).await;
+            results.push((server_name, result));
+        }
+
+        Ok(results)
+    }
 }
 
 #[inline]
